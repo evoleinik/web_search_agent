@@ -24,12 +24,40 @@ This agent uses DuckDuckGo to fetch and process 50+ pages per query — similar 
 - **Autonomous**: Single command searches, filters, fetches, and reports
 - **Smart Filtering**: Skips blocked domains, login walls, CAPTCHA pages
 - **Fast**: HTTP/2 connection pooling, parallel fetch (30-40% faster)
+- **Observable**: Per-phase timing, failure breakdown, slow URL identification
 - **Zero Setup**: Auto-installs dependencies via uv
 
 ## Requirements
 
 - **uv**: Auto-installed by wrapper scripts
 - **Python 3.11+**: Auto-installed by uv if needed
+
+## Diagnostics
+
+Default output (stderr) shows timing at each phase:
+
+```
+Researching: "Python asyncio tutorial"
+  [search] 10 URLs in 1.0s
+    fetch: 10/10 (9 ok, 2s)
+  Done: 9/10 ok (35,567 chars) in 2.6s
+  Skipped: 1 HTTP 403
+```
+
+With `-v` (verbose), you see every URL individually:
+
+```
+Researching: "Python asyncio tutorial"
+  [search] 10 URLs in 1.0s
+    --   0.2s  python.plainenglish.io (HTTP 403)
+    OK   0.4s  blog.apify.com
+    OK   0.5s  docs.python.org
+    OK   1.6s  www.lambdatest.com
+  Done: 9/10 ok (35,567 chars) in 2.6s
+  Skipped: 1 HTTP 403
+```
+
+Slow URLs (>5s) are always listed in the summary, even without `-v`.
 
 ## Blocked Domains
 

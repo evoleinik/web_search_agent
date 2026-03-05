@@ -27,16 +27,10 @@ import asyncio
 import json
 import logging
 import random
-import os
 import re
 import ssl
 import sys
 import time
-
-# Force UTF-8 stdout/stderr on Windows to avoid cp1251/charmap encoding errors
-if sys.platform == "win32" and not os.environ.get("PYTHONIOENCODING"):
-    sys.stdout = open(sys.stdout.fileno(), mode='w', encoding='utf-8', errors='replace', closefd=False)
-    sys.stderr = open(sys.stderr.fileno(), mode='w', encoding='utf-8', errors='replace', closefd=False)
 import urllib.parse
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -185,31 +179,75 @@ class ResearchStats:
 # =============================================================================
 
 class ProgressReporter:
-    """Unified progress reporting."""
+    """Progress reporting with timing and per-URL diagnostics."""
 
-    def __init__(self, quiet: bool = False):
+    def __init__(self, quiet: bool = False, verbose: bool = False):
         self.quiet = quiet
+        self.verbose = verbose
         self._last_line_len = 0
+        self._phase_start: float = 0
+        self._total_start: float = time.monotonic()
+        self._ok_count = 0
+        self._failures: List[Tuple[str, str, float]] = []  # (url, error, elapsed)
 
     def message(self, msg: str) -> None:
-        """Print a message line."""
         if not self.quiet:
             print(msg, file=sys.stderr)
 
-    def update(self, phase: str, current: int, total: int) -> None:
-        """Update progress on same line."""
+    def phase_start(self, name: str) -> None:
+        self._phase_start = time.monotonic()
+
+    def phase_end(self, name: str) -> None:
+        elapsed = time.monotonic() - self._phase_start
         if not self.quiet:
-            line = f"\r    {phase.capitalize()}: {current}/{total}"
-            # Clear previous content if shorter
-            padding = max(0, self._last_line_len - len(line))
-            print(f"{line}{' ' * padding}", end="", file=sys.stderr)
-            self._last_line_len = len(line)
+            print(f"  [{name}] {elapsed:.1f}s", file=sys.stderr)
+
+    def url_result(self, url: str, success: bool, elapsed: float, error: str = "") -> None:
+        if success:
+            self._ok_count += 1
+            if self.verbose and not self.quiet:
+                domain = urllib.parse.urlparse(url).netloc
+                print(f"    OK  {elapsed:4.1f}s  {domain}", file=sys.stderr)
+        else:
+            self._failures.append((url, error, elapsed))
+            if self.verbose and not self.quiet:
+                domain = urllib.parse.urlparse(url).netloc
+                print(f"    --  {elapsed:4.1f}s  {domain} ({error})", file=sys.stderr)
+
+    def update(self, phase: str, current: int, total: int) -> None:
+        if self.quiet or self.verbose:
+            return
+        elapsed = time.monotonic() - self._phase_start
+        line = f"\r    {phase}: {current}/{total} ({self._ok_count} ok, {elapsed:.0f}s)"
+        padding = max(0, self._last_line_len - len(line))
+        print(f"{line}{' ' * padding}", end="", file=sys.stderr)
+        self._last_line_len = len(line)
 
     def newline(self) -> None:
-        """Print newline after progress updates."""
-        if not self.quiet:
+        if not self.quiet and not self.verbose:
             print(file=sys.stderr)
             self._last_line_len = 0
+
+    def summary(self, fetched_ok: int, total: int, chars: int) -> None:
+        if self.quiet:
+            return
+        total_elapsed = time.monotonic() - self._total_start
+        print(f"  Done: {fetched_ok}/{total} ok ({chars:,} chars) in {total_elapsed:.1f}s", file=sys.stderr)
+
+        if self._failures:
+            by_error: dict[str, int] = {}
+            slow: List[Tuple[str, float]] = []
+            for url, error, elapsed in self._failures:
+                by_error[error] = by_error.get(error, 0) + 1
+                if elapsed >= 5.0:
+                    slow.append((url, elapsed))
+            parts = [f"{count} {err}" for err, count in sorted(by_error.items(), key=lambda x: -x[1])]
+            print(f"  Skipped: {', '.join(parts)}", file=sys.stderr)
+            if slow:
+                print(f"  Slow (>5s):", file=sys.stderr)
+                for url, elapsed in sorted(slow, key=lambda x: -x[1])[:5]:
+                    domain = urllib.parse.urlparse(url).netloc
+                    print(f"    {elapsed:4.1f}s  {domain}", file=sys.stderr)
 
 
 # =============================================================================
@@ -425,9 +463,11 @@ async def fetch_single_async(
     timeout: int,
     min_content_length: int,
     max_content_length: int,
-    user_agent: str = ""
+    user_agent: str = "",
+    progress: Optional[ProgressReporter] = None
 ) -> FetchResult:
     """Fetch single URL (async)."""
+    t0 = time.monotonic()
     try:
         resp = await client.get(
             url,
@@ -438,30 +478,49 @@ async def fetch_single_async(
             timeout=timeout,
             follow_redirects=True
         )
+        elapsed = time.monotonic() - t0
         if resp.status_code == 200:
-            # Early content-length check to skip huge pages
             content_length = resp.headers.get('content-length')
             if content_length and int(content_length) > MAX_CONTENT_BYTES:
+                if progress:
+                    progress.url_result(url, False, elapsed, "Too large")
                 return FetchResult(url=url, success=False, error="Content too large")
 
-            # Check for CAPTCHA/blocked page before extraction
             raw_text = resp.text
             if is_blocked_content(raw_text):
+                if progress:
+                    progress.url_result(url, False, elapsed, "CAPTCHA/blocked")
                 return FetchResult(url=url, success=False, error="CAPTCHA/blocked")
 
             content = extract_text(raw_text)
             if len(content) >= min_content_length:
-                return _create_fetch_result(url, content, "direct", min_content_length, max_content_length)
+                result = _create_fetch_result(url, content, "direct", min_content_length, max_content_length)
+                if progress:
+                    progress.url_result(url, True, elapsed)
+                return result
+            if progress:
+                progress.url_result(url, False, elapsed, "Too short")
             return FetchResult(url=url, success=False, error="Content too short")
         else:
+            if progress:
+                progress.url_result(url, False, elapsed, f"HTTP {resp.status_code}")
             return FetchResult(url=url, success=False, error=f"HTTP {resp.status_code}")
     except httpx.TimeoutException:
+        elapsed = time.monotonic() - t0
+        if progress:
+            progress.url_result(url, False, elapsed, "Timeout")
         return FetchResult(url=url, success=False, error="Timeout")
     except httpx.RequestError as e:
+        elapsed = time.monotonic() - t0
         logger.debug(f"Request error for {url}: {e}")
+        if progress:
+            progress.url_result(url, False, elapsed, "Request error")
         return FetchResult(url=url, success=False, error="Request error")
     except httpx.HTTPStatusError as e:
+        elapsed = time.monotonic() - t0
         logger.debug(f"HTTP status error for {url}: {e}")
+        if progress:
+            progress.url_result(url, False, elapsed, f"HTTP {e.response.status_code}")
         return FetchResult(url=url, success=False, error=f"HTTP {e.response.status_code}")
 
 
@@ -538,45 +597,45 @@ async def run_research_async(
     Yields FetchResult objects as they complete.
     """
     progress.message(f'Researching: "{config.query}"')
-    progress.message("  Mode: streaming pipeline (search + fetch in parallel)")
 
     urls: List[str] = []
     fetch_queue: asyncio.Queue[Optional[str]] = asyncio.Queue()
     result_queue: asyncio.Queue[Optional[FetchResult]] = asyncio.Queue()
     stats = ResearchStats(query=config.query)
+    search_elapsed: float = 0
 
     async def search_producer() -> None:
-        """Search and queue URLs for fetching (streams results as they arrive)."""
+        nonlocal search_elapsed
         loop = asyncio.get_event_loop()
         ddg = DuckDuckGoSearch()
+        t0 = time.monotonic()
 
         def search_and_stream():
-            """Run search and queue URLs immediately as found."""
             for url, title in ddg.search(config.query, config.search_results):
                 urls.append(url)
                 stats.urls_searched = len(urls)
-                # Queue URL immediately for fetching (thread-safe)
                 loop.call_soon_threadsafe(fetch_queue.put_nowait, url)
 
         with ThreadPoolExecutor(max_workers=1) as executor:
             await loop.run_in_executor(executor, search_and_stream)
 
-        # Signal end of search
+        search_elapsed = time.monotonic() - t0
+        progress.message(f"  [search] {stats.urls_searched} URLs in {search_elapsed:.1f}s")
         await fetch_queue.put(None)
 
     async def fetch_consumer(client: httpx.AsyncClient) -> None:
-        """Fetch URLs and queue results."""
         semaphore = asyncio.Semaphore(config.max_concurrent)
         pending: List[asyncio.Task] = []
-        fetch_limit = config.fetch_count  # 0 means unlimited
-        session_ua = get_random_user_agent()  # Single UA per session
+        fetch_limit = config.fetch_count
+        session_ua = get_random_user_agent()
 
         async def fetch_one(url: str) -> None:
             async with semaphore:
                 result = await fetch_single_async(
                     client, url, config.timeout,
                     config.min_content_length, config.max_content_length,
-                    user_agent=session_ua
+                    user_agent=session_ua,
+                    progress=progress
                 )
                 await result_queue.put(result)
 
@@ -591,10 +650,10 @@ async def run_research_async(
             await asyncio.gather(*pending, return_exceptions=True)
         await result_queue.put(None)
 
-    # HTTP/2 enabled with optimized connection pool
+    progress.phase_start("fetch")
     async with httpx.AsyncClient(
         verify=False,
-        http2=True,  # Enable HTTP/2 for multiplexing
+        http2=True,
         limits=httpx.Limits(
             max_connections=config.max_concurrent,
             max_keepalive_connections=config.max_concurrent,
@@ -602,11 +661,9 @@ async def run_research_async(
         ),
         timeout=httpx.Timeout(config.timeout, connect=5.0)
     ) as client:
-        # Start search and fetch concurrently
         asyncio.create_task(search_producer())
         asyncio.create_task(fetch_consumer(client))
 
-        # Yield results as they arrive
         fetched = 0
         while True:
             result = await result_queue.get()
@@ -620,7 +677,7 @@ async def run_research_async(
             yield result
 
     progress.newline()
-    progress.message(f"  Done: {stats.urls_fetched}/{stats.urls_searched} pages ({stats.content_chars:,} chars)")
+    progress.summary(stats.urls_fetched, stats.urls_searched, stats.content_chars)
 
 
 # =============================================================================
@@ -682,9 +739,9 @@ def format_batch_markdown(results: List[FetchResult], query: str, max_preview: i
 # MAIN ENTRY POINTS
 # =============================================================================
 
-def run_research(config: ResearchConfig) -> Optional[List[FetchResult]]:
+def run_research(config: ResearchConfig, verbose: bool = False) -> Optional[List[FetchResult]]:
     """Execute research and output results."""
-    progress = ProgressReporter(quiet=config.quiet)
+    progress = ProgressReporter(quiet=config.quiet, verbose=verbose)
 
     if config.stream:
         # Streaming mode: output results as they arrive
@@ -760,11 +817,9 @@ Blocked domains: reddit, twitter, facebook, youtube, tiktok, instagram, linkedin
 
     try:
         if args.stream:
-            # Streaming mode outputs directly
-            run_research(config)
+            run_research(config, verbose=args.verbose)
         else:
-            # Batch mode
-            results = run_research(config)
+            results = run_research(config, verbose=args.verbose)
             if results:
                 if args.output == "json":
                     print(format_batch_json(results, config.query))
