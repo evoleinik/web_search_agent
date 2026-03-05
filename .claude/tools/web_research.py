@@ -238,7 +238,13 @@ class ProgressReporter:
         if self.quiet:
             return
         total_elapsed = time.monotonic() - self._total_start
-        print(f"  Done: {fetched_ok}/{total} ok ({chars:,} chars) in {total_elapsed:.1f}s", file=sys.stderr)
+        rate = (fetched_ok / total * 100) if total > 0 else 0
+        rate_indicator = ""
+        if rate < 50:
+            rate_indicator = " ⚠ LOW"
+        elif rate < 70:
+            rate_indicator = " ↓"
+        print(f"  Done: {fetched_ok}/{total} ok ({rate:.0f}%{rate_indicator}) — {chars:,} chars in {total_elapsed:.1f}s", file=sys.stderr)
 
         if self._failures:
             by_error: dict[str, int] = {}
