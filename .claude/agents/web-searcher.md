@@ -33,18 +33,20 @@ You are a web research specialist.
 | `-t, --timeout N` | Fetch timeout (seconds) | 20 |
 | `-c, --concurrent N` | Max concurrent connections | 20 |
 | `-q, --quiet` | Suppress progress | false |
-| `-v, --verbose` | Enable debug logging | false |
+| `-v, --verbose` | Show per-URL timing and status | false |
 | `--stream` | Stream output (reduces memory) | false |
 
 ## Output Example
 
 ```
 Researching: "AI agents best practices 2025"
-  Mode: streaming pipeline (search + fetch in parallel)
-  Done: 43/50 pages (165,448 chars)
+  [search] 50 URLs in 2.1s
+    fetch: 50/50 (43 ok, 8s)
+  Done: 43/50 ok (165,448 chars) in 10.2s
+  Skipped: 4 Content too short, 2 HTTP 403, 1 Timeout
 ```
 
-- `43/43 pages`: Successfully fetched / total URLs
+With `-v`, each URL prints its own status line (`OK` or `--` with error).
 
 ## Report Template
 
