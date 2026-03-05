@@ -80,13 +80,11 @@ BLOCKED_DOMAINS: Tuple[str, ...] = (
 )
 
 SKIP_URL_PATTERNS: Tuple[str, ...] = (
-    r"\.pdf$", r"\.jpg$", r"\.png$", r"\.gif$", r"\.svg$", r"\.webp$",
+    r"\.jpg$", r"\.png$", r"\.gif$", r"\.svg$", r"\.webp$",
     r"/login", r"/signin", r"/signup", r"/cart", r"/checkout",
     r"/tag/", r"/tags/", r"/category/", r"/categories/",
     r"/archive/", r"/page/\d+",
-    # Removed: amazon/ebay (useful product info),
-    # /product/ /products/ /store/ (blocks review sites and docs),
-    # /topic/ /topics/ (blocks legit content), /shop/ /buy/ (too broad)
+    # .pdf: now handled via pandoc extraction
 )
 
 
@@ -153,8 +151,9 @@ RE_LEADING_SPACE = re.compile(r"\n[ \t]+")
 RE_MULTI_NEWLINE = re.compile(r"\n{3,}")
 RE_WHITESPACE = re.compile(r"\s+")
 
-# w3m availability (checked once at import)
+# External tool availability (checked once at import)
 W3M_PATH = shutil.which("w3m")
+PDFTOTEXT_PATH = shutil.which("pdftotext")
 
 # =============================================================================
 # REQUIRED DEPENDENCIES (managed by uv)
@@ -560,6 +559,32 @@ def _extract_with_scrapling_fallback(page, min_length: int) -> str:
     return ""
 
 
+def _is_pdf(raw: str, url: str) -> bool:
+    """Detect PDF content by magic bytes or URL."""
+    return "%PDF" in raw[:50] or url.lower().endswith(".pdf")
+
+
+def _extract_pdf(raw_bytes: bytes) -> str:
+    """Extract text from PDF using pdftotext (poppler). Writes to temp file since pdftotext needs seekable input."""
+    if not PDFTOTEXT_PATH:
+        return ""
+    import tempfile
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=True) as f:
+            f.write(raw_bytes)
+            f.flush()
+            result = subprocess.run(
+                [PDFTOTEXT_PATH, "-layout", f.name, "-"],
+                capture_output=True,
+                timeout=30,
+            )
+            if result.returncode == 0:
+                return result.stdout.decode("utf-8", errors="replace").strip()
+    except (subprocess.TimeoutExpired, OSError):
+        pass
+    return ""
+
+
 def _extract_content(raw_html: str) -> Tuple[str, str]:
     """CPU-bound: extract text + JSON-LD from HTML. Runs in process pool."""
     structured = extract_jsonld_metadata(raw_html)
@@ -600,6 +625,22 @@ async def fetch_single_async(
         if len(raw_html) > MAX_CONTENT_BYTES:
             # Truncate HTML but still try to extract text
             raw_html = raw_html[:MAX_CONTENT_BYTES]
+
+        if _is_pdf(raw_html, url):
+            # PDF: extract via pandoc in process pool
+            raw_body = page.body if isinstance(page.body, bytes) else raw_html.encode("utf-8", errors="replace")
+            loop = asyncio.get_event_loop()
+            content = await loop.run_in_executor(
+                _get_extract_pool(), _extract_pdf, raw_body
+            )
+            if not content:
+                if progress:
+                    progress.url_result(url, False, elapsed, "PDF extraction failed")
+                return FetchResult(url=url, success=False, error="PDF extraction failed")
+            result = _create_fetch_result(url, content, min_content_length, max_content_length)
+            if progress:
+                progress.url_result(url, result.success, elapsed, result.error or "")
+            return result
 
         if is_blocked_content(raw_html):
             if progress:
