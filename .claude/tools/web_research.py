@@ -154,7 +154,7 @@ class ResearchConfig:
     timeout: int = 20
     quiet: bool = False
     min_content_length: int = 600
-    max_concurrent: int = 20  # Increased for HTTP/2 multiplexing
+    max_concurrent: int = 50  # Match default search count
     search_results: int = 50
     stream: bool = False
 
@@ -800,8 +800,8 @@ Blocked domains: reddit, twitter, facebook, youtube, tiktok, instagram, linkedin
                         help="Output format (default: raw)")
     parser.add_argument("-t", "--timeout", type=int, default=10,
                         help="Fetch timeout in seconds (default: 10)")
-    parser.add_argument("-c", "--concurrent", type=int, default=20,
-                        help="Max concurrent connections (default: 20)")
+    parser.add_argument("-c", "--concurrent", type=int, default=50,
+                        help="Max concurrent connections (default: 50)")
     parser.add_argument("-q", "--quiet", action="store_true",
                         help="Suppress progress messages")
     parser.add_argument("-v", "--verbose", action="store_true",
