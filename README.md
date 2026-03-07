@@ -23,7 +23,7 @@ This agent uses DuckDuckGo + Brave to fetch and process 50+ pages per query — 
 - **Deep Search**: 50+ results via DDG + Brave Search fallback
 - **Anti-Bot Bypass**: Scrapling with TLS fingerprinting (curl-cffi) — passes where httpx gets 403'd
 - **Stealth Retry**: Blocked pages auto-retry via headless browser (Camoufox, max 5 retries)
-- **Smart Extraction**: w3m > regex > Scrapling DOM parser (tiered fallback, fixes "Too short" pages)
+- **Smart Extraction**: Trafilatura content-area detection (article body, not nav/sidebar noise)
 - **Observable**: Per-phase timing, failure breakdown, slow URL identification
 - **Zero Setup**: Auto-installs dependencies via uv
 
@@ -31,7 +31,6 @@ This agent uses DuckDuckGo + Brave to fetch and process 50+ pages per query — 
 
 - **uv**: Auto-installed by wrapper scripts
 - **Python 3.11+**: Auto-installed by uv if needed
-- **w3m** (optional): Better HTML rendering (tables, lists). Falls back to regex if not installed
 
 ## Brave Search (Optional)
 
@@ -80,7 +79,7 @@ Slow URLs (>5s) are always listed in the summary, even without `-v`.
 ```
 -s N          Number of search results (default: 20)
 -f N          Max pages to fetch (default: 10)
--m N          Max chars per page (default: 15000)
+-m N          Max chars per page (default: 8000)
 -o FORMAT     Output format: text (default), json, raw, markdown
 -v            Verbose: show per-URL timing
 --url URL ... Direct URL fetch (skip search)

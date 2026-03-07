@@ -13,4 +13,4 @@ Dependencies handled automatically via uv.
 - **DDG** primary + **Brave** fallback (set `BRAVE_API_KEY` env var or `~/.config/brave/api_key`)
 - **Scrapling AsyncFetcher** for fast TLS-fingerprinted fetching (bypasses 403s)
 - **StealthyFetcher** auto-retry for blocked/CAPTCHA pages (disable with `--no-stealth`)
-- **Text extraction**: w3m > regex > Scrapling DOM parser (tiered fallback)
+- **Text extraction**: Trafilatura (content-area detection, boilerplate removal) > regex fallback
