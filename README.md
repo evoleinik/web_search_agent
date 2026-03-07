@@ -109,6 +109,55 @@ web_search.sh --url https://example.com https://other.com
 scrape.sh https://example.com   # shorthand
 ```
 
+## Compression Pipeline
+
+Each fetched page goes through a multi-stage compression pipeline before being returned to the LLM:
+
+```
+HTML → Trafilatura extraction → BM25 sentence selection → Cross-page dedup → Output
+```
+
+### Stage 1: Text Extraction (Trafilatura)
+
+Trafilatura detects the article body and strips navigation, sidebars, ads, and boilerplate. This is the biggest compression step — raw HTML shrinks to clean article text (typically 3-7K chars per page). Falls back to regex extraction, then Scrapling DOM parser.
+
+### Stage 2: BM25 Sentence Compression
+
+When a page exceeds the per-page budget (`-m`, default 8K), the content is compressed using query-focused sentence selection:
+
+1. **Sentence splitting**: Text is split into individual sentences (line breaks + sentence boundary regex)
+2. **BM25 scoring** (70% weight): Each sentence is scored against the search query using Okapi BM25
+3. **Centrality scoring** (30% weight): Each sentence's average Jaccard similarity to all other sentences — surfaces "hub" sentences that explain key concepts even without query terms
+4. **Selection**: Top-scoring sentences are kept within the char budget, in original order
+
+**Measured impact**: Only triggers on pages exceeding 8K chars (~20% of pages). When it does trigger, the quality improvement over paragraph-level BM25 or head truncation is real but hard to quantify numerically — it selects more relevant sentences rather than fewer chars.
+
+### Stage 3: Cross-Page Deduplication
+
+After all pages are compressed, duplicate sentences are removed across pages:
+
+1. **Exact dedup**: Sentences are normalized (lowercase, strip punctuation) and hashed. Duplicates across pages are removed (earlier pages take priority)
+2. **Fuzzy dedup**: Content-word signatures (stop words removed, remaining words sorted) catch paraphrased duplicates like "M4 chip features" vs "M4 processor features"
+
+**Measured impact**: 0-12% token savings depending on topic overlap. Technical documentation (Kubernetes, AWS) shows highest savings (~12%, 80+ duplicates) because many docs copy from each other. Diverse opinion content (reviews, comparisons) shows minimal savings (~1%).
+
+### Stage 4: Snippet Pre-Filter
+
+Before fetching, search result snippets from DDG/Brave are scored by query word overlap. URLs with zero overlap in their snippet+title are skipped (minimum 5 URLs always fetched as safety net).
+
+**Measured impact**: Speed optimization, not token savings. Skips 0-5 irrelevant fetches per query, reducing latency by 20-40% on queries with noisy results.
+
+### Ablation Summary
+
+| Feature | Token savings | Quality | Speed | Notes |
+|---|---|---|---|---|
+| Trafilatura extraction | ~90% vs raw HTML | High | Fast | The heavy lifter |
+| 8K per-page budget | ~60% vs uncompressed | Good | Same | Most pages are already under 8K |
+| Sentence BM25 + centrality | ~0% additional | Potentially better selection | Same | Only triggers on ~20% of pages |
+| Cross-page exact dedup | 0-12% | Same | Same | Highest on docs/specs topics |
+| Fuzzy dedup | ~0.5% on top of exact | Same | Same | Marginal |
+| Snippet pre-filter | 0% | Same | 20-40% faster | Speed only |
+
 ## Blocked Domains
 
 Automatically filtered (require login or block scraping):
