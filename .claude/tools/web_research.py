@@ -830,7 +830,9 @@ atexit.register(_shutdown_extract_pool)
 
 RE_WIKIPEDIA_URL = re.compile(r'https?://(\w+)\.wikipedia\.org/wiki/(.+?)(?:#.*)?$')
 RE_GITHUB_REPO_URL = re.compile(r'https?://github\.com/([^/]+)/([^/]+?)(?:/?|/tree/[^/]+/?)?$')
-RE_STACKOVERFLOW_URL = re.compile(r'https?://stackoverflow\.com/questions/(\d+)')
+RE_STACKEXCHANGE_URL = re.compile(r'https?://([^/]+\.(?:stackexchange|stackoverflow|serverfault|superuser|askubuntu)\.com)/questions/(\d+)')
+RE_DEVTO_URL = re.compile(r'https?://dev\.to/[^/]+/[^/]+$')
+RE_ARXIV_URL = re.compile(r'https?://arxiv\.org/(?:abs|pdf)/(\d+\.\d+)')
 
 def _fetch_wikipedia_api(lang: str, title: str, max_length: int) -> Optional[str]:
     """Fetch clean text from Wikipedia API (no scraping needed)."""
@@ -872,11 +874,15 @@ def _fetch_github_readme(owner: str, repo: str, max_length: int) -> Optional[str
         pass
     return None
 
-def _fetch_stackoverflow_api(question_id: str, max_length: int) -> Optional[str]:
+def _fetch_stackexchange_api(site_domain: str, question_id: str, max_length: int) -> Optional[str]:
     """Fetch question + top answers from Stack Exchange API (clean markdown)."""
     import urllib.request
     import gzip
-    api_url = f"https://api.stackexchange.com/2.3/questions/{question_id}?order=desc&sort=activity&site=stackoverflow&filter=withbody"
+    # Map domain to SE API site name
+    site_map = {"stackoverflow.com": "stackoverflow", "serverfault.com": "serverfault",
+                "superuser.com": "superuser", "askubuntu.com": "askubuntu"}
+    site = site_map.get(site_domain) or site_domain.split(".")[0]  # quant.stackexchange.com -> quant
+    api_url = f"https://api.stackexchange.com/2.3/questions/{question_id}?order=desc&sort=activity&site={site}&filter=withbody"
     try:
         req = urllib.request.Request(api_url, headers={"User-Agent": "web-research-tool/1.0"})
         with urllib.request.urlopen(req, timeout=5) as resp:
@@ -899,7 +905,7 @@ def _fetch_stackoverflow_api(question_id: str, max_length: int) -> Optional[str]
         parts = [f"# {title}\n\n{q_body}"]
 
         # Fetch top answers
-        ans_url = f"https://api.stackexchange.com/2.3/questions/{question_id}/answers?order=desc&sort=votes&site=stackoverflow&filter=withbody&pagesize=3"
+        ans_url = f"https://api.stackexchange.com/2.3/questions/{question_id}/answers?order=desc&sort=votes&site={site}&filter=withbody&pagesize=3"
         req = urllib.request.Request(ans_url, headers={"User-Agent": "web-research-tool/1.0"})
         with urllib.request.urlopen(req, timeout=5) as resp:
             raw = resp.read()
@@ -920,6 +926,66 @@ def _fetch_stackoverflow_api(question_id: str, max_length: int) -> Optional[str]
         pass
     return None
 
+def _fetch_devto_api(url: str, max_length: int) -> Optional[str]:
+    """Fetch Dev.to article via Forem API (clean markdown body)."""
+    import urllib.request
+    # Dev.to API can look up by URL path
+    api_url = f"https://dev.to/api/articles/{url.split('dev.to/')[-1]}"
+    try:
+        req = urllib.request.Request(api_url, headers={"User-Agent": "web-research-tool/1.0"})
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read().decode())
+        title = data.get("title", "")
+        body = data.get("body_markdown", "") or data.get("body_html", "")
+        if body and "<" in body[:100]:
+            # Got HTML, strip tags
+            body = unescape(re.sub(r'<[^>]+>', '', body)).strip()
+        tag_list = data.get("tag_list", [])
+        tags = tag_list if isinstance(tag_list, str) else ", ".join(tag_list)
+        header = f"# {title}\n"
+        if tags:
+            header += f"Tags: {tags}\n"
+        header += "\n"
+        return (header + body)[:max_length] if body else None
+    except Exception:
+        pass
+    return None
+
+def _fetch_arxiv_api(paper_id: str, max_length: int) -> Optional[str]:
+    """Fetch ArXiv paper metadata + abstract via Atom API."""
+    import urllib.request
+    import xml.etree.ElementTree as ET
+    api_url = f"http://export.arxiv.org/api/query?id_list={paper_id}"
+    try:
+        req = urllib.request.Request(api_url, headers={"User-Agent": "web-research-tool/1.0"})
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            xml_data = resp.read().decode()
+        root = ET.fromstring(xml_data)
+        ns = {"atom": "http://www.w3.org/2005/Atom", "arxiv": "http://arxiv.org/schemas/atom"}
+        entry = root.find("atom:entry", ns)
+        if entry is None:
+            return None
+        title = (entry.findtext("atom:title", "", ns) or "").strip().replace("\n", " ")
+        abstract = (entry.findtext("atom:summary", "", ns) or "").strip()
+        authors = [a.findtext("atom:name", "", ns) for a in entry.findall("atom:author", ns)]
+        published = (entry.findtext("atom:published", "", ns) or "")[:10]
+        categories = [c.get("term", "") for c in entry.findall("atom:category", ns)]
+
+        parts = [f"# {title}\n"]
+        if authors:
+            parts.append(f"Authors: {', '.join(authors[:10])}")
+        if published:
+            parts.append(f"Published: {published}")
+        if categories:
+            parts.append(f"Categories: {', '.join(categories[:5])}")
+        parts.append(f"\n## Abstract\n\n{abstract}")
+
+        text = "\n".join(parts)
+        return text[:max_length] if text else None
+    except Exception:
+        pass
+    return None
+
 async def fetch_single_async(
     url: str,
     timeout: int,
@@ -933,24 +999,35 @@ async def fetch_single_async(
     try:
         # API fast-path: use native APIs for sites that produce cleaner output than scraping
         api_content = None
-        wiki_match = RE_WIKIPEDIA_URL.match(url)
-        gh_match = RE_GITHUB_REPO_URL.match(url) if not wiki_match else None
-        so_match = RE_STACKOVERFLOW_URL.match(url) if not wiki_match and not gh_match else None
         loop = asyncio.get_event_loop()
+        wiki_match = RE_WIKIPEDIA_URL.match(url)
         if wiki_match:
             lang, title = wiki_match.group(1), wiki_match.group(2)
             api_content = await loop.run_in_executor(
                 None, _fetch_wikipedia_api, lang, title, max_content_length
             )
-        elif gh_match:
+        gh_match = RE_GITHUB_REPO_URL.match(url) if not api_content else None
+        if gh_match:
             owner, repo = gh_match.group(1), gh_match.group(2)
             api_content = await loop.run_in_executor(
                 None, _fetch_github_readme, owner, repo, max_content_length
             )
-        elif so_match:
-            question_id = so_match.group(1)
+        se_match = RE_STACKEXCHANGE_URL.match(url) if not api_content else None
+        if se_match:
+            site_domain, question_id = se_match.group(1), se_match.group(2)
             api_content = await loop.run_in_executor(
-                None, _fetch_stackoverflow_api, question_id, max_content_length
+                None, _fetch_stackexchange_api, site_domain, question_id, max_content_length
+            )
+        devto_match = RE_DEVTO_URL.match(url) if not api_content else None
+        if devto_match:
+            api_content = await loop.run_in_executor(
+                None, _fetch_devto_api, url, max_content_length
+            )
+        arxiv_match = RE_ARXIV_URL.match(url) if not api_content else None
+        if arxiv_match:
+            paper_id = arxiv_match.group(1)
+            api_content = await loop.run_in_executor(
+                None, _fetch_arxiv_api, paper_id, max_content_length
             )
         if api_content:
             elapsed = time.monotonic() - t0
