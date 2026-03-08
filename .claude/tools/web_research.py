@@ -1941,8 +1941,10 @@ Blocked domains: reddit, twitter, facebook, youtube, tiktok, instagram, linkedin
                         help="Global char budget across all pages (0 = unlimited)")
     parser.add_argument("--no-stealth", action="store_true",
                         help="Disable stealth browser retry for blocked pages")
-    parser.add_argument("-S", "--summarize", action="store_true",
-                        help="Summarize results via Gemini Flash (reduces output ~10x)")
+    parser.add_argument("-S", "--summarize", action="store_true", default=True,
+                        help="Summarize results via Gemini Flash (default: on, reduces output ~10x)")
+    parser.add_argument("--no-summarize", action="store_true",
+                        help="Disable Gemini summarization, output raw text")
     parser.add_argument("--usage", action="store_true",
                         help="Show usage statistics (last 30 days)")
     parser.add_argument("--quality", action="store_true",
@@ -1953,6 +1955,10 @@ Blocked domains: reddit, twitter, facebook, youtube, tiktok, instagram, linkedin
     if args.usage or args.quality:
         print_usage_stats(quality=args.quality)
         sys.exit(0)
+
+    # --no-summarize overrides -S default
+    if args.no_summarize:
+        args.summarize = False
 
     # JSON output must not have progress messages mixed in (agents parse stdout)
     if args.output == "json":
