@@ -1090,11 +1090,19 @@ async def fetch_single_async(
             api_content = await loop.run_in_executor(
                 None, _fetch_reddit_json, reddit_path, max_content_length
             )
+        # For API-routed domains, if API failed, scraping won't help — bail early
+        api_only = yt_match or tw_match or reddit_match
         if api_content:
             elapsed = time.monotonic() - t0
             result = _create_fetch_result(url, api_content, min_content_length, max_content_length, query=query)
             if progress:
                 progress.url_result(url, result.success, elapsed, result.error or "")
+            return result
+        if api_only:
+            elapsed = time.monotonic() - t0
+            result = FetchResult(url=url, success=False, error="API extraction failed")
+            if progress:
+                progress.url_result(url, False, elapsed, "API failed")
             return result
         page = await AsyncFetcher.get(url, timeout=timeout, stealthy_headers=True)
         elapsed = time.monotonic() - t0
@@ -1421,11 +1429,13 @@ async def run_research_async(
         def search_and_stream():
             nonlocal ddg_count, brave_count, skipped
             enqueued = 0
+            seen_in_search: Set[str] = set()
             for url, title, snippet in searcher.search(config.query, config.search_results):
                 if global_seen_urls is not None:
                     if url in global_seen_urls:
                         continue
                     global_seen_urls.add(url)
+                seen_in_search.add(url)
                 urls.append(url)
                 stats.urls_searched = len(urls)
                 # Snippet relevance gate: skip URLs with zero query word overlap
@@ -1436,6 +1446,54 @@ async def run_research_async(
                     continue
                 loop.call_soon_threadsafe(fetch_queue.put_nowait, url)
                 enqueued += 1
+
+            # Supplement with DDG video + news results (bonus URLs not in web search)
+            def _enqueue_bonus(url: str) -> None:
+                nonlocal enqueued
+                if url in seen_in_search or not is_valid_url(url) or is_blocked_url(url):
+                    return
+                if global_seen_urls is not None:
+                    if url in global_seen_urls:
+                        return
+                    global_seen_urls.add(url)
+                seen_in_search.add(url)
+                urls.append(url)
+                stats.urls_searched = len(urls)
+                loop.call_soon_threadsafe(fetch_queue.put_nowait, url)
+                enqueued += 1
+
+            try:
+                ddg = DDGS(verify=False)
+                for r in ddg.videos(config.query, max_results=5):
+                    url = r.get("content", r.get("embed_url", ""))
+                    if url:
+                        _enqueue_bonus(url)
+            except Exception:
+                pass
+
+            try:
+                ddg = DDGS(verify=False)
+                for r in ddg.news(config.query, max_results=5):
+                    url = r.get("url", "")
+                    if url:
+                        _enqueue_bonus(url)
+            except Exception:
+                pass
+
+            # Reddit discussions via Reddit search API
+            try:
+                import urllib.request
+                reddit_q = urllib.parse.quote(config.query)
+                api_url = f"https://www.reddit.com/search.json?q={reddit_q}&sort=relevance&limit=5"
+                req = urllib.request.Request(api_url, headers={"User-Agent": "web-research-tool/1.0 (research)"})
+                with urllib.request.urlopen(req, timeout=5) as resp:
+                    data = json.loads(resp.read().decode())
+                for child in data.get("data", {}).get("children", []):
+                    permalink = child.get("data", {}).get("permalink", "")
+                    if permalink:
+                        _enqueue_bonus(f"https://www.reddit.com{permalink}")
+            except Exception:
+                pass
 
             ddg_count = len(urls)
 
