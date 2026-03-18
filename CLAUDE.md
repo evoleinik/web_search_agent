@@ -1,24 +1,23 @@
 ## Web Research
 
-**Search freely.** With Gemini summarization enabled, each search costs ~500 tokens (~2K chars). Do 10-20+ searches per session without hesitation. Search whenever curious, don't ration.
+**Use the built-in WebSearch tool** for all web searches. Call multiple WebSearch in parallel for related queries.
 
 For any internet search:
 
-1. Run `./.claude/tools/web_search.sh "query"` — searches, fetches, and summarizes via Gemini Flash (default)
-2. **Multiple queries: always combine into one call** — `./.claude/tools/web_search.sh "query1" "query2" "query3" -s 10`. Runs in parallel with cross-query URL dedup. Never make separate Bash calls for related queries.
-3. Use `-s N` for result count, `-f N` for fetch limit, `-v` for per-URL timing, `--no-summarize` for raw output
-4. Summarization is on by default (~10-20x compression, preserves all technical details). Requires `GEMINI_API_KEY` env var; falls back to raw output if unset
+1. Use the `WebSearch` tool directly — no bash, no scripts
+2. **Multiple queries: call multiple WebSearch tools in parallel** in a single message
+3. For fetching a specific known URL: `~/.claude/tools/scrape.sh <url>`
 
-**Note**: Always use forward slashes (`/`) in paths, even on Windows.
-Dependencies handled automatically via uv.
+### Deep fetch fallback
+When WebSearch snippets aren't enough and you need full page content:
+- `~/.claude/tools/web_search.sh "query"` — fetches 50 full pages (raw text, no summarization)
+- Add `-S` flag for Gemini summarization (~10x compression)
+- `--cache-only` for instant recall from previous searches
+- `--cache-stats` for cache health
 
-### Search tiers
-- **DDG** primary + **Brave** fallback (set `BRAVE_API_KEY` env var or `~/.config/brave/api_key`)
-- **Snippet pre-filter**: skips URLs with zero query word overlap in snippet+title
-- **Scrapling AsyncFetcher** for fast TLS-fingerprinted fetching (bypasses 403s)
-- **StealthyFetcher** auto-retry for blocked/CAPTCHA pages (disable with `--no-stealth`)
-- **Text extraction**: Trafilatura (content-area detection, boilerplate removal) > regex fallback
-- **Summarization** (default): Gemini Flash API summarizes results (~10x compression). Disable with `--no-summarize`
-- **Search Memory**: SQLite cache with nomic-embed-text embeddings — `--cache-only` for instant recall, `--no-cache` to bypass, `--cache-stats` for stats
-- **Source Authority**: ~100 hardcoded domain scores (1.0 official docs → 0.3 content farms) used in cache ranking
-- **BM25 compression** (legacy, not recommended): `-g N` enables sentence-level compression. Hurts factual accuracy
+### Rules
+- SEARCH BY DEFAULT. Your knowledge has a cutoff date.
+- The failure mode is NOT "I searched unnecessarily" — it's "I confidently gave outdated advice."
+- ALWAYS search before: recommending tools/libraries, comparing options, debugging unfamiliar errors
+- MANDATORY search for AI/LLM topics: models, APIs, SDKs, protocols, agent frameworks
+- Only SKIP search for: pure logic/algorithms, code you've already read, project-internal questions

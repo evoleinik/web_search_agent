@@ -31,7 +31,7 @@ This agent uses DuckDuckGo + Brave to fetch and process 50+ pages per query — 
 - **Search Memory**: SQLite cache with vector embeddings — repeated/similar queries return from cache instantly
 - **Source Authority**: Hardcoded domain tier map (~100 domains) ranks authoritative sources higher
 - **Observable**: Per-phase timing, failure breakdown, slow URL identification
-- **Gemini Summarization**: Results summarized via Gemini Flash by default (~10x compression, preserves technical details)
+- **Gemini Summarization**: Optional Gemini Flash summarization via `-S` flag (~10x compression, preserves technical details). Off by default.
 - **Zero Setup**: Auto-installs dependencies via uv
 
 ## Requirements

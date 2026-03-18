@@ -1977,10 +1977,10 @@ Blocked domains: reddit, twitter, facebook, youtube, tiktok, instagram, linkedin
                         help="Global char budget across all pages (0 = unlimited)")
     parser.add_argument("--no-stealth", action="store_true",
                         help="Disable stealth browser retry for blocked pages")
-    parser.add_argument("-S", "--summarize", action="store_true", default=True,
-                        help="Summarize results via Gemini Flash (default: on, reduces output ~10x)")
+    parser.add_argument("-S", "--summarize", action="store_true", default=False,
+                        help="Summarize results via Gemini Flash (default: off)")
     parser.add_argument("--no-summarize", action="store_true",
-                        help="Disable Gemini summarization, output raw text")
+                        help="Disable Gemini summarization (default, kept for compat)")
     parser.add_argument("--no-cache", action="store_true",
                         help="Skip cache lookup and write")
     parser.add_argument("--cache-only", action="store_true",
