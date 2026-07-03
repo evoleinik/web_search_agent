@@ -96,7 +96,13 @@ Slow URLs (>5s) are always listed in the summary, even without `-v`. Low success
 -c N          Max concurrent connections (default: 50)
 -u URL ...    Direct URL fetch (skip search)
 --stream      Stream results as they arrive
---no-stealth  Disable headless browser retry for blocked pages
+--no-stealth  Disable rung 2: the local headless-browser retry for blocked pages
+--no-brightdata  Disable rung 3: the paid Bright Data Web Unlocker last-resort tier
+--country XX  Route the Bright Data tier through a country (ISO alpha-2, e.g. us, de, gb)
+--no-rung-memory  Ignore per-domain rung memory (always run the full ladder)
+--sci         Add scientific bonus sources (arXiv, OpenAlex)
+--med         Add medical bonus sources (PubMed, Europe PMC, OpenAlex)
+--tech        Add tech bonus sources (Hacker News, Stack Overflow, Dev.to, GitHub)
 --no-cache    Skip cache lookup and write
 --cache-only  Only return cached results, no web fetch
 --cache-stats Print cache statistics and exit
@@ -104,6 +110,16 @@ Slow URLs (>5s) are always listed in the summary, even without `-v`. Low success
 --usage       Show usage statistics (last 30 days)
 --quality     Show usage stats with output quality analysis
 ```
+
+## Fetch escalation ladder
+
+Blocked pages climb a 3-rung ladder, escalating only the URLs that fail:
+
+1. **Direct** — Scrapling `AsyncFetcher` with a real TLS fingerprint (free, ~5s).
+2. **Stealth** — local headless browser (`StealthyFetcher`) for anti-bot pages (free, 10-30s). `--no-stealth` to skip.
+3. **Bright Data** — Web Unlocker renders + solves CAPTCHAs server-side (paid, 15-90s). Needs a token in `~/.config/brightdata/api_token`; `--no-brightdata` to skip, `--country XX` to geo-route.
+
+**Per-domain rung memory** (`~/.cache/web_research/rung_memory.json`, 30-day TTL): once a domain needs Bright Data, that fact is remembered so future fetches skip the slow stealth rung and go straight to BD — saving 10-30s per blocked page. Rung 1 always runs first, so a site that later unblocks recovers for free and the memory becomes moot (self-healing). `--no-rung-memory` disables it.
 
 ## Multi-Query
 

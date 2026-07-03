@@ -118,6 +118,16 @@ BRIGHTDATA_ENDPOINT = "https://api.brightdata.com/request"
 # direct fetch (15-90s on hard WAFs). It gets its own floor, independent of --timeout.
 BRIGHTDATA_TIMEOUT = int(os.environ.get("BRIGHTDATA_TIMEOUT", "90"))
 
+# Per-domain rung memory: remember which ladder rung a domain last *needed*, so we skip
+# the slow local-stealth attempt (10-30s) on domains only Bright Data can unblock.
+# Self-healing by design: rung 1 (direct, ~5s, free) is ALWAYS tried first upstream, so a
+# site that silently unblocks recovers there and the memory becomes moot. Only "brightdata"
+# is recorded — the one hint with value; stealth-only domains just re-run stealth (correct).
+RUNG_MEMORY_PATH = Path(
+    os.environ.get("XDG_CACHE_HOME", str(Path.home() / ".cache"))
+) / "web_research" / "rung_memory.json"
+RUNG_MEMORY_TTL = int(os.environ.get("WEB_RESEARCH_RUNG_TTL", str(30 * 86400)))  # 30 days
+
 # =============================================================================
 # COMPILED REGEX PATTERNS
 # =============================================================================
@@ -210,6 +220,7 @@ class ResearchConfig:
     scientific: bool = False
     medical: bool = False
     tech: bool = False
+    no_rung_memory: bool = False
 
 
 @dataclass
@@ -1329,6 +1340,45 @@ async def fetch_brightdata_async(
         return FetchResult(url=url, success=False, error=f"BD: {error_msg}", source="brightdata")
 
 
+def _rung_domain(url: str) -> str:
+    """Host key for rung memory (lowercased netloc, leading www. stripped)."""
+    host = urllib.parse.urlparse(url).netloc.lower()
+    return host[4:] if host.startswith("www.") else host
+
+
+def _rung_memory_load() -> dict:
+    """Load the rung-memory map. Best-effort — a missing/corrupt file is an empty map."""
+    try:
+        return json.loads(RUNG_MEMORY_PATH.read_text())
+    except (FileNotFoundError, ValueError, OSError):
+        return {}
+
+
+def _rung_memory_get(domain: str) -> Optional[str]:
+    """Remembered rung for a domain, or None if absent/expired."""
+    entry = _rung_memory_load().get(domain)
+    if not entry:
+        return None
+    if time.time() - entry.get("ts", 0) > RUNG_MEMORY_TTL:
+        return None
+    return entry.get("rung")
+
+
+def _rung_memory_set(domain: str, rung: str) -> None:
+    """Record that `domain` needed `rung`. Best-effort; never raises into the fetch path."""
+    if not domain:
+        return
+    try:
+        mem = _rung_memory_load()
+        mem[domain] = {"rung": rung, "ts": int(time.time())}
+        RUNG_MEMORY_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = RUNG_MEMORY_PATH.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(mem))
+        tmp.replace(RUNG_MEMORY_PATH)  # atomic
+    except OSError:
+        pass
+
+
 async def escalate_if_blocked(
     result: FetchResult,
     min_content_length: int,
@@ -1337,6 +1387,7 @@ async def escalate_if_blocked(
     *,
     no_stealth: bool = False,
     no_brightdata: bool = False,
+    no_rung_memory: bool = False,
     progress: Optional[ProgressReporter] = None,
     query: str = "",
     country: str = "",
@@ -1346,10 +1397,17 @@ async def escalate_if_blocked(
     Rung 2: local StealthyFetcher (free) on block-type errors.
     Rung 3: Bright Data Web Unlocker (paid) when still blocked and a token is present.
     Used by both the direct-fetch and search paths so the algorithm stays DRY.
+
+    Rung memory: if a domain has historically needed Bright Data, skip the slow rung-2
+    stealth attempt and go straight to BD. STEALTH_RETRY_ERRORS ⊆ BRIGHTDATA_RETRY_ERRORS,
+    so any error that made this a stealth candidate is also BD-eligible — the skip can
+    never strand a recoverable page. Rung 1 already ran, so this only fires when still blocked.
     """
     if result.success:
         return result
-    if not no_stealth and result.error in STEALTH_RETRY_ERRORS:
+    domain = _rung_domain(result.url)
+    known_bd = (not no_rung_memory) and _rung_memory_get(domain) == "brightdata"
+    if not no_stealth and not known_bd and result.error in STEALTH_RETRY_ERRORS:
         result = await fetch_stealth_async(
             result.url, min_content_length, max_content_length, progress=progress, query=query,
         )
@@ -1359,6 +1417,8 @@ async def escalate_if_blocked(
         result = await fetch_brightdata_async(
             result.url, min_content_length, max_content_length, timeout, progress=progress, query=query, country=country,
         )
+        if result.success and not no_rung_memory:
+            _rung_memory_set(domain, "brightdata")
     return result
 
 
@@ -1954,6 +2014,7 @@ async def run_research_async(
             escalate_if_blocked(
                 cand, config.min_content_length, config.max_content_length, config.timeout,
                 no_stealth=config.no_stealth, no_brightdata=config.no_brightdata,
+                no_rung_memory=config.no_rung_memory,
                 progress=progress, query=config.query, country=config.country,
             )
             for cand in retry_candidates
@@ -2375,6 +2436,8 @@ Blocked domains: reddit, twitter, facebook, youtube, tiktok, instagram, linkedin
                         help="Disable the paid Bright Data Web Unlocker last-resort tier")
     parser.add_argument("--country", default="", metavar="XX",
                         help="Route the Bright Data tier through a specific country (ISO alpha-2, e.g. us, de, gb)")
+    parser.add_argument("--no-rung-memory", action="store_true",
+                        help="Ignore per-domain rung memory (always run the full ladder; don't record BD needs)")
     parser.add_argument("--sci", action="store_true",
                         help="Enable scientific bonus sources (arXiv, OpenAlex)")
     parser.add_argument("--med", action="store_true",
@@ -2437,7 +2500,8 @@ Blocked domains: reddit, twitter, facebook, youtube, tiktok, instagram, linkedin
             for result in await asyncio.gather(*tasks):
                 result = await escalate_if_blocked(
                     result, 100, url_max, args.timeout,
-                    no_stealth=args.no_stealth, no_brightdata=args.no_brightdata, progress=progress,
+                    no_stealth=args.no_stealth, no_brightdata=args.no_brightdata,
+                    no_rung_memory=args.no_rung_memory, progress=progress,
                     country=args.country,
                 )
                 results.append(result)
@@ -2490,6 +2554,7 @@ Blocked domains: reddit, twitter, facebook, youtube, tiktok, instagram, linkedin
             scientific=args.sci,
             medical=args.med,
             tech=args.tech,
+            no_rung_memory=args.no_rung_memory,
         )
 
     # Hard wall-clock timeout: kill the entire process after 5 minutes
