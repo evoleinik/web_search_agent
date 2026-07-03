@@ -11,7 +11,8 @@ Unified tool combining search and fetch into a single optimized workflow:
 1. Search via DuckDuckGo + Brave (fallback) for maximum coverage
 2. Filter and deduplicate URLs during search (early filtering)
 3. Fetch content in parallel via Scrapling (TLS fingerprinting, anti-bot bypass)
-4. Stealth browser retry for blocked pages (403/CAPTCHA)
+4. Blocked-page escalation ladder: local stealth browser (camoufox) then Bright Data
+   Web Unlocker (paid, last-resort). Search path escalates only the failing URLs.
 5. Scrapling text extraction fallback for "Too short" pages
 6. Output combined results (streaming or batched)
 
@@ -107,6 +108,16 @@ BLOCKED_CONTENT_MARKERS: Tuple[str, ...] = (
 # Brave Search API key: set BRAVE_API_KEY env var, or place key in ~/.config/brave/api_key
 BRAVE_API_KEY_PATH = Path(os.environ.get("BRAVE_API_KEY_FILE", str(Path.home() / ".config" / "brave" / "api_key")))
 
+# Bright Data Web Unlocker: last-resort fetch tier for WAF/anti-bot/JS-SPA pages.
+# Token: BRIGHTDATA_API_TOKEN env var, or ~/.config/brightdata/api_token
+# Zone:  BRIGHTDATA_ZONE env var, or ~/.config/brightdata/zone (default web_unlocker1)
+BRIGHTDATA_TOKEN_PATH = Path(os.environ.get("BRIGHTDATA_API_TOKEN_FILE", str(Path.home() / ".config" / "brightdata" / "api_token")))
+BRIGHTDATA_ZONE_PATH = Path(Path.home() / ".config" / "brightdata" / "zone")
+BRIGHTDATA_ENDPOINT = "https://api.brightdata.com/request"
+# Web Unlocker renders + solves anti-bot server-side, so it is much slower than a
+# direct fetch (15-90s on hard WAFs). It gets its own floor, independent of --timeout.
+BRIGHTDATA_TIMEOUT = int(os.environ.get("BRIGHTDATA_TIMEOUT", "90"))
+
 # =============================================================================
 # COMPILED REGEX PATTERNS
 # =============================================================================
@@ -194,6 +205,7 @@ class ResearchConfig:
     search_results: int = 50
     stream: bool = False
     no_stealth: bool = False
+    no_brightdata: bool = False
 
 
 @dataclass
@@ -1200,6 +1212,147 @@ async def fetch_stealth_async(
 
 
 # =============================================================================
+# BRIGHT DATA WEB UNLOCKER (paid last-resort tier for hard WAF / anti-bot)
+# =============================================================================
+
+# Escalate to Bright Data when the free rungs (direct + stealth) still fail with
+# a block/timeout-type error. A clean 404 must NOT retry — no wasted spend.
+BRIGHTDATA_RETRY_ERRORS = {
+    "HTTP 403", "HTTP 429", "CAPTCHA/blocked", "Timeout",
+    "Stealth HTTP 403", "Stealth HTTP 429", "Stealth still blocked",
+}
+
+
+def _load_brightdata_token() -> Optional[str]:
+    """Load Bright Data API token from env var or config file."""
+    key = os.environ.get("BRIGHTDATA_API_TOKEN", "")
+    if key:
+        return key.strip()
+    try:
+        return BRIGHTDATA_TOKEN_PATH.read_text().strip()
+    except (FileNotFoundError, PermissionError):
+        return None
+
+
+def _load_brightdata_zone() -> str:
+    """Load Bright Data zone from env var or config file (default web_unlocker1)."""
+    zone = os.environ.get("BRIGHTDATA_ZONE", "")
+    if zone:
+        return zone.strip()
+    try:
+        return BRIGHTDATA_ZONE_PATH.read_text().strip() or "web_unlocker1"
+    except (FileNotFoundError, PermissionError):
+        return "web_unlocker1"
+
+
+def _should_try_brightdata(error: str) -> bool:
+    """True if a failed fetch's error is worth escalating to Bright Data."""
+    return bool(error) and (error in BRIGHTDATA_RETRY_ERRORS or error.startswith("Stealth"))
+
+
+def _brightdata_fetch_raw(url: str, token: str, zone: str, timeout: int) -> bytes:
+    """Blocking POST to the Web Unlocker API. Returns the rendered page bytes."""
+    import urllib.request
+    payload = json.dumps({"zone": zone, "url": url, "format": "raw"}).encode("utf-8")
+    req = urllib.request.Request(
+        BRIGHTDATA_ENDPOINT, data=payload, method="POST",
+        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return resp.read()
+
+
+async def fetch_brightdata_async(
+    url: str,
+    min_content_length: int,
+    max_content_length: int,
+    timeout: int,
+    progress: Optional[ProgressReporter] = None,
+    query: str = "",
+) -> FetchResult:
+    """Fetch a URL via the Bright Data Web Unlocker (rendered HTML through the shared extractor)."""
+    token = _load_brightdata_token()
+    if not token:
+        return FetchResult(url=url, success=False, error="No Bright Data token", source="brightdata")
+    zone = _load_brightdata_zone()
+    # Web Unlocker renders + solves anti-bot server-side (15-90s), so it needs its own
+    # floor independent of the fast direct-fetch --timeout (default 5s).
+    bd_timeout = max(timeout, BRIGHTDATA_TIMEOUT)
+    t0 = time.monotonic()
+    loop = asyncio.get_event_loop()
+    try:
+        raw_bytes = await asyncio.wait_for(
+            loop.run_in_executor(None, _brightdata_fetch_raw, url, token, zone, bd_timeout),
+            timeout=bd_timeout + 10,
+        )
+        elapsed = time.monotonic() - t0
+
+        raw_html = raw_bytes.decode("utf-8", errors="replace")
+        if _is_pdf(raw_html, url):
+            # Web Unlocker 400s on most PDFs; if bytes came back anyway, try to extract.
+            content = await loop.run_in_executor(_get_extract_pool(), _extract_pdf, raw_bytes)
+            if not content:
+                if progress:
+                    progress.url_result(url, False, elapsed, "BD PDF extraction failed")
+                return FetchResult(url=url, success=False, error="BD PDF extraction failed", source="brightdata")
+        else:
+            if len(raw_html) > MAX_CONTENT_BYTES:
+                raw_html = raw_html[:MAX_CONTENT_BYTES]
+            if is_blocked_content(raw_html):
+                if progress:
+                    progress.url_result(url, False, elapsed, "BD still blocked")
+                return FetchResult(url=url, success=False, error="BD still blocked", source="brightdata")
+            content, structured = await loop.run_in_executor(_get_extract_pool(), _extract_content, raw_html)
+            if structured:
+                content = structured + content
+
+        result = _create_fetch_result(url, content, min_content_length, max_content_length, query=query)
+        result.source = "brightdata"
+        if progress:
+            progress.url_result(url, result.success, elapsed, result.error or "")
+        return result
+
+    except Exception as e:
+        elapsed = time.monotonic() - t0
+        error_msg = str(e)[:50] if str(e) else type(e).__name__
+        if progress:
+            progress.url_result(url, False, elapsed, f"BD: {error_msg}")
+        return FetchResult(url=url, success=False, error=f"BD: {error_msg}", source="brightdata")
+
+
+async def escalate_if_blocked(
+    result: FetchResult,
+    min_content_length: int,
+    max_content_length: int,
+    timeout: int,
+    *,
+    no_stealth: bool = False,
+    no_brightdata: bool = False,
+    progress: Optional[ProgressReporter] = None,
+    query: str = "",
+) -> FetchResult:
+    """Shared escalation ladder: given an already-attempted fetch, climb the remaining rungs.
+
+    Rung 2: local StealthyFetcher (free) on block-type errors.
+    Rung 3: Bright Data Web Unlocker (paid) when still blocked and a token is present.
+    Used by both the direct-fetch and search paths so the algorithm stays DRY.
+    """
+    if result.success:
+        return result
+    if not no_stealth and result.error in STEALTH_RETRY_ERRORS:
+        result = await fetch_stealth_async(
+            result.url, min_content_length, max_content_length, progress=progress, query=query,
+        )
+    if result.success:
+        return result
+    if not no_brightdata and _should_try_brightdata(result.error) and _load_brightdata_token():
+        result = await fetch_brightdata_async(
+            result.url, min_content_length, max_content_length, timeout, progress=progress, query=query,
+        )
+    return result
+
+
+# =============================================================================
 # SEARCH BACKENDS
 # =============================================================================
 
@@ -1552,29 +1705,35 @@ async def run_research_async(
     progress.newline()
     progress.summary(stats.urls_fetched, stats.urls_searched, stats.content_chars)
 
-    # Phase 2: Stealth retry for blocked/403/CAPTCHA pages (parallel)
-    if stealth_candidates and not config.no_stealth:
-        retry_urls = [r.url for r in stealth_candidates[:MAX_STEALTH_RETRIES]]
-        progress.message(f"  [stealth] retrying {len(retry_urls)} blocked URLs...")
+    # Phase 2: Escalate ONLY the failing/blocked pages up the ladder (stealth → Bright Data).
+    # Capped so a search never fans all results out to the paid tier — same DRY algorithm as
+    # the direct-fetch path via escalate_if_blocked.
+    if stealth_candidates and not (config.no_stealth and config.no_brightdata):
+        retry_candidates = stealth_candidates[:MAX_STEALTH_RETRIES]
+        progress.message(f"  [retry] escalating {len(retry_candidates)} blocked URLs...")
         progress._ok_count = 0
         progress._failures = []
-        progress.phase_start("stealth")
+        progress.phase_start("retry")
 
-        stealth_results = await asyncio.gather(*(
-            fetch_stealth_async(url, config.min_content_length, config.max_content_length, progress=progress, query=config.query)
-            for url in retry_urls
+        retry_results = await asyncio.gather(*(
+            escalate_if_blocked(
+                cand, config.min_content_length, config.max_content_length, config.timeout,
+                no_stealth=config.no_stealth, no_brightdata=config.no_brightdata,
+                progress=progress, query=config.query,
+            )
+            for cand in retry_candidates
         ))
 
-        stealth_ok = 0
-        for result in stealth_results:
+        recovered = 0
+        for result in retry_results:
             if result.success:
-                stealth_ok += 1
+                recovered += 1
                 stats.urls_fetched += 1
                 stats.content_chars += len(result.content)
             yield result
 
         progress.newline()
-        progress.message(f"  [stealth] {stealth_ok}/{len(retry_urls)} recovered")
+        progress.message(f"  [retry] {recovered}/{len(retry_candidates)} recovered")
 
 
 # =============================================================================
@@ -1977,6 +2136,8 @@ Blocked domains: reddit, twitter, facebook, youtube, tiktok, instagram, linkedin
                         help="Global char budget across all pages (0 = unlimited)")
     parser.add_argument("--no-stealth", action="store_true",
                         help="Disable stealth browser retry for blocked pages")
+    parser.add_argument("--no-brightdata", action="store_true",
+                        help="Disable the paid Bright Data Web Unlocker last-resort tier")
     parser.add_argument("-S", "--summarize", action="store_true", default=False,
                         help="Summarize results via Gemini Flash (default: off)")
     parser.add_argument("--no-summarize", action="store_true",
@@ -2031,8 +2192,10 @@ Blocked domains: reddit, twitter, facebook, youtube, tiktok, instagram, linkedin
                 for url in args.url
             ]
             for result in await asyncio.gather(*tasks):
-                if not result.success and result.error in STEALTH_RETRY_ERRORS and not args.no_stealth:
-                    result = await fetch_stealth_async(result.url, 100, url_max, progress=progress)
+                result = await escalate_if_blocked(
+                    result, 100, url_max, args.timeout,
+                    no_stealth=args.no_stealth, no_brightdata=args.no_brightdata, progress=progress,
+                )
                 results.append(result)
             return results
 
@@ -2078,6 +2241,7 @@ Blocked domains: reddit, twitter, facebook, youtube, tiktok, instagram, linkedin
             search_results=args.search,
             stream=args.stream,
             no_stealth=args.no_stealth,
+            no_brightdata=args.no_brightdata,
         )
 
     # Hard wall-clock timeout: kill the entire process after 5 minutes
