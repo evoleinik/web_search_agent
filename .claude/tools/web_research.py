@@ -207,6 +207,9 @@ class ResearchConfig:
     no_stealth: bool = False
     no_brightdata: bool = False
     country: str = ""
+    scientific: bool = False
+    medical: bool = False
+    tech: bool = False
 
 
 @dataclass
@@ -228,6 +231,7 @@ class ResearchStats:
     urls_fetched: int = 0
     urls_filtered: int = 0
     content_chars: int = 0
+    bonus_sources: Optional[dict] = None  # {source_name: count}
 
 
 def _quality_fields(results: Optional[List[FetchResult]]) -> dict:
@@ -1591,7 +1595,9 @@ async def run_research_async(
                 enqueued += 1
 
             # Supplement with DDG video + news results (bonus URLs not in web search)
-            def _enqueue_bonus(url: str) -> None:
+            stats.bonus_sources = {}
+
+            def _enqueue_bonus(url: str, source: str = "") -> None:
                 nonlocal enqueued
                 if url in seen_in_search or not is_valid_url(url) or is_blocked_url(url):
                     return
@@ -1602,6 +1608,8 @@ async def run_research_async(
                 seen_in_search.add(url)
                 urls.append(url)
                 stats.urls_searched = len(urls)
+                if source:
+                    stats.bonus_sources[source] = stats.bonus_sources.get(source, 0) + 1
                 loop.call_soon_threadsafe(fetch_queue.put_nowait, url)
                 enqueued += 1
 
@@ -1619,7 +1627,7 @@ async def run_research_async(
                     for r in ddg.news(config.query, max_results=5):
                         url = r.get("url", "")
                         if url and _bonus_relevant(r.get("title", ""), r.get("body", "")):
-                            _enqueue_bonus(url)
+                            _enqueue_bonus(url, "news")
                 except Exception:
                     pass
 
@@ -1636,12 +1644,230 @@ async def run_research_async(
                         permalink = d.get("permalink", "")
                         title = d.get("title", "")
                         if permalink and _bonus_relevant(title, d.get("selftext", "")[:200]):
-                            _enqueue_bonus(f"https://www.reddit.com{permalink}")
+                            _enqueue_bonus(f"https://www.reddit.com{permalink}", "reddit")
                 except Exception:
                     pass
 
-            with ThreadPoolExecutor(max_workers=2) as bonus_pool:
-                list(bonus_pool.map(lambda f: f(), [_bonus_news, _bonus_reddit]))
+            def _bonus_arxiv():
+                """Search arXiv API, fallback to Semantic Scholar if arXiv fails."""
+                arxiv_ok = False
+                try:
+                    import urllib.request
+                    import xml.etree.ElementTree as ET
+                    # Strip dates/filler, use AND between core terms for precision
+                    _arxiv_skip = {"recent", "latest", "new", "advances", "applications",
+                                   "current", "overview", "update", "the", "and", "for", "with", "from"}
+                    words = [w for w in config.query.split()
+                             if not re.match(r'^\d{4}$', w) and w.lower() not in _arxiv_skip]
+                    core = words[:4]  # max 4 key terms
+                    arxiv_query = " AND ".join(f"all:{w}" for w in core) if core else config.query
+                    encoded = urllib.parse.quote_plus(arxiv_query)
+                    api_url = f"http://export.arxiv.org/api/query?search_query={encoded}&start=0&max_results=5&sortBy=relevance"
+                    req = urllib.request.Request(api_url, headers={"User-Agent": "web-research-tool/1.0"})
+                    with urllib.request.urlopen(req, timeout=8) as resp:
+                        xml_data = resp.read().decode("utf-8", errors="replace")
+                    root = ET.fromstring(xml_data)
+                    ns = {"atom": "http://www.w3.org/2005/Atom"}
+                    for entry in root.findall("atom:entry", ns):
+                        for link in entry.findall("atom:link", ns):
+                            href = link.get("href", "")
+                            if "arxiv.org/abs/" in href:
+                                _enqueue_bonus(href, "arxiv")
+                                arxiv_ok = True
+                                break
+                except Exception:
+                    pass
+                # Fallback: Semantic Scholar if arXiv returned nothing
+                if not arxiv_ok:
+                    try:
+                        import urllib.request
+                        encoded = urllib.parse.quote_plus(config.query)
+                        api_url = f"https://api.semanticscholar.org/graph/v1/paper/search?query={encoded}&limit=10&fields=url,externalIds"
+                        req = urllib.request.Request(api_url, headers={"User-Agent": "web-research-tool/1.0"})
+                        with urllib.request.urlopen(req, timeout=8) as resp:
+                            data = json.loads(resp.read().decode("utf-8", errors="replace"))
+                        for paper in (data.get("data") or []):
+                            ext_ids = paper.get("externalIds") or {}
+                            arxiv_id = ext_ids.get("ArXiv")
+                            if arxiv_id:
+                                _enqueue_bonus(f"https://arxiv.org/abs/{arxiv_id}", "scholar")
+                            else:
+                                paper_id = paper.get("paperId", "")
+                                if paper_id:
+                                    _enqueue_bonus(f"https://www.semanticscholar.org/paper/{paper_id}", "scholar")
+                    except Exception:
+                        pass
+
+            def _bonus_pubmed():
+                """Search PubMed via NCBI E-utilities (free, no key)."""
+                try:
+                    import urllib.request
+                    encoded = urllib.parse.quote_plus(config.query)
+                    api_url = f"https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi?db=pubmed&term={encoded}&retmax=5&retmode=json&sort=relevance"
+                    req = urllib.request.Request(api_url, headers={"User-Agent": "web-research-tool/1.0"})
+                    with urllib.request.urlopen(req, timeout=8) as resp:
+                        data = json.loads(resp.read().decode("utf-8", errors="replace"))
+                    for pmid in (data.get("esearchresult", {}).get("idlist") or []):
+                        _enqueue_bonus(f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/", "pubmed")
+                except Exception:
+                    pass
+
+            def _bonus_openalex():
+                """Search OpenAlex for papers (free, no key for basic search)."""
+                try:
+                    import urllib.request
+                    encoded = urllib.parse.quote_plus(config.query)
+                    api_url = f"https://api.openalex.org/works?search={encoded}&per_page=5&mailto=web-research-tool@example.com"
+                    req = urllib.request.Request(api_url, headers={"User-Agent": "web-research-tool/1.0"})
+                    with urllib.request.urlopen(req, timeout=8) as resp:
+                        data = json.loads(resp.read().decode("utf-8", errors="replace"))
+                    for work in (data.get("results") or []):
+                        # Prefer open access URL, then DOI, then landing page
+                        oa = work.get("open_access") or {}
+                        url = oa.get("oa_url")
+                        if not url:
+                            doi = work.get("doi")
+                            if doi:
+                                url = doi  # DOI URLs like https://doi.org/10.1234/...
+                        if not url:
+                            loc = work.get("primary_location") or {}
+                            url = loc.get("landing_page_url")
+                        if url:
+                            _enqueue_bonus(url, "openalex")
+                except Exception:
+                    pass
+
+            def _bonus_europepmc():
+                """Search Europe PMC for papers (free, no key, more OA full-text than PubMed)."""
+                try:
+                    import urllib.request
+                    encoded = urllib.parse.quote_plus(config.query)
+                    api_url = f"https://www.ebi.ac.uk/europepmc/webservices/rest/search?query={encoded}&format=json&pageSize=5&sort=CITED%20desc"
+                    req = urllib.request.Request(api_url, headers={"User-Agent": "web-research-tool/1.0"})
+                    with urllib.request.urlopen(req, timeout=8) as resp:
+                        data = json.loads(resp.read().decode("utf-8", errors="replace"))
+                    for result in (data.get("resultList", {}).get("result") or []):
+                        # Prefer full-text URL, then DOI, then Europe PMC page
+                        url = None
+                        doi = result.get("doi")
+                        if doi:
+                            url = f"https://doi.org/{doi}"
+                        if not url:
+                            pmcid = result.get("pmcid")
+                            if pmcid:
+                                url = f"https://europepmc.org/article/PMC/{pmcid}"
+                            else:
+                                pmid = result.get("pmid")
+                                if pmid:
+                                    url = f"https://europepmc.org/article/MED/{pmid}"
+                        if url:
+                            _enqueue_bonus(url, "europepmc")
+                except Exception:
+                    pass
+
+            def _bonus_hackernews():
+                """Search Hacker News via Algolia API (free, no key, 10K/hr)."""
+                try:
+                    import urllib.request
+                    # Use top 3 key terms to avoid zero-result long queries
+                    _hn_skip = {"best", "practices", "latest", "recent", "new", "how", "what",
+                                "the", "and", "for", "with", "from", "using", "guide", "tutorial"}
+                    words = [w for w in config.query.split() if w.lower() not in _hn_skip][:3]
+                    hn_query = " ".join(words) if words else config.query
+                    encoded = urllib.parse.quote_plus(hn_query)
+                    api_url = f"https://hn.algolia.com/api/v1/search?query={encoded}&tags=story&hitsPerPage=5"
+                    req = urllib.request.Request(api_url, headers={"User-Agent": "web-research-tool/1.0"})
+                    with urllib.request.urlopen(req, timeout=8) as resp:
+                        data = json.loads(resp.read().decode("utf-8", errors="replace"))
+                    for hit in (data.get("hits") or []):
+                        url = hit.get("url")
+                        if url:
+                            _enqueue_bonus(url, "hackernews")
+                        else:
+                            # Ask HN / Show HN posts without external URL — link to HN discussion
+                            story_id = hit.get("objectID")
+                            if story_id:
+                                _enqueue_bonus(f"https://news.ycombinator.com/item?id={story_id}", "hackernews")
+                except Exception:
+                    pass
+
+            def _bonus_stackoverflow():
+                """Search Stack Overflow API (free, no key, 300/day unauth)."""
+                try:
+                    import urllib.request
+                    encoded = urllib.parse.quote_plus(config.query)
+                    api_url = f"https://api.stackexchange.com/2.3/search/excerpts?order=desc&sort=relevance&q={encoded}&site=stackoverflow&pagesize=5&filter=default"
+                    req = urllib.request.Request(api_url, headers={
+                        "User-Agent": "web-research-tool/1.0",
+                        "Accept-Encoding": "gzip",
+                    })
+                    with urllib.request.urlopen(req, timeout=8) as resp:
+                        # SO API always returns gzip
+                        raw = resp.read()
+                        if resp.headers.get("Content-Encoding") == "gzip":
+                            import gzip
+                            raw = gzip.decompress(raw)
+                        data = json.loads(raw.decode("utf-8", errors="replace"))
+                    for item in (data.get("items") or []):
+                        qid = item.get("question_id")
+                        if qid:
+                            _enqueue_bonus(f"https://stackoverflow.com/questions/{qid}", "stackoverflow")
+                except Exception:
+                    pass
+
+            def _bonus_devto():
+                """Search Dev.to API for articles (free, no key)."""
+                try:
+                    import urllib.request
+                    encoded = urllib.parse.quote_plus(config.query)
+                    # Dev.to doesn't have keyword search in API, but per_page+tag works
+                    api_url = f"https://dev.to/api/articles?per_page=5&top=365"
+                    # Try tag-based search with first keyword
+                    words = config.query.split()
+                    if words:
+                        tag = re.sub(r'[^a-zA-Z0-9]', '', words[0]).lower()
+                        if tag:
+                            api_url += f"&tag={tag}"
+                    req = urllib.request.Request(api_url, headers={"User-Agent": "web-research-tool/1.0"})
+                    with urllib.request.urlopen(req, timeout=8) as resp:
+                        data = json.loads(resp.read().decode("utf-8", errors="replace"))
+                    for article in (data if isinstance(data, list) else []):
+                        url = article.get("url")
+                        if url:
+                            _enqueue_bonus(url, "devto")
+                except Exception:
+                    pass
+
+            def _bonus_github_repos():
+                """Search GitHub repositories API (free, no key, 10/min unauth)."""
+                try:
+                    import urllib.request
+                    encoded = urllib.parse.quote_plus(config.query)
+                    api_url = f"https://api.github.com/search/repositories?q={encoded}&sort=stars&per_page=5"
+                    req = urllib.request.Request(api_url, headers={
+                        "User-Agent": "web-research-tool/1.0",
+                        "Accept": "application/vnd.github.v3+json",
+                    })
+                    with urllib.request.urlopen(req, timeout=8) as resp:
+                        data = json.loads(resp.read().decode("utf-8", errors="replace"))
+                    for repo in (data.get("items") or []):
+                        url = repo.get("html_url")
+                        if url:
+                            _enqueue_bonus(url, "github")
+                except Exception:
+                    pass
+
+            bonus_fns = [_bonus_news, _bonus_reddit]
+            if config.scientific:
+                bonus_fns.extend([_bonus_arxiv, _bonus_openalex])
+            if config.medical:
+                bonus_fns.extend([_bonus_pubmed, _bonus_europepmc])
+                if not config.scientific:
+                    bonus_fns.append(_bonus_openalex)
+            if config.tech:
+                bonus_fns.extend([_bonus_hackernews, _bonus_stackoverflow, _bonus_devto, _bonus_github_repos])
+            with ThreadPoolExecutor(max_workers=len(bonus_fns)) as bonus_pool:
+                list(bonus_pool.map(lambda f: f(), bonus_fns))
 
             ddg_count = len(urls)
 
@@ -1657,6 +1883,9 @@ async def run_research_async(
                 source_info += " (DDG)"
             if skipped:
                 source_info += f", {skipped} filtered"
+            if stats.bonus_sources:
+                bonus_parts = [f"{v} {k}" for k, v in sorted(stats.bonus_sources.items())]
+                source_info += f" [+{', '.join(bonus_parts)}]"
             progress.message(f"  [search] {source_info} in {search_elapsed:.1f}s")
         except Exception as e:
             search_elapsed = time.monotonic() - t0
@@ -2146,6 +2375,12 @@ Blocked domains: reddit, twitter, facebook, youtube, tiktok, instagram, linkedin
                         help="Disable the paid Bright Data Web Unlocker last-resort tier")
     parser.add_argument("--country", default="", metavar="XX",
                         help="Route the Bright Data tier through a specific country (ISO alpha-2, e.g. us, de, gb)")
+    parser.add_argument("--sci", action="store_true",
+                        help="Enable scientific bonus sources (arXiv, OpenAlex)")
+    parser.add_argument("--med", action="store_true",
+                        help="Enable medical bonus sources (PubMed, Europe PMC, OpenAlex)")
+    parser.add_argument("--tech", action="store_true",
+                        help="Enable tech bonus sources (Hacker News, Stack Overflow, Dev.to, GitHub)")
     parser.add_argument("-S", "--summarize", action="store_true", default=False,
                         help="Summarize results via Gemini Flash (default: off)")
     parser.add_argument("--no-summarize", action="store_true",
@@ -2252,6 +2487,9 @@ Blocked domains: reddit, twitter, facebook, youtube, tiktok, instagram, linkedin
             no_stealth=args.no_stealth,
             no_brightdata=args.no_brightdata,
             country=args.country,
+            scientific=args.sci,
+            medical=args.med,
+            tech=args.tech,
         )
 
     # Hard wall-clock timeout: kill the entire process after 5 minutes
