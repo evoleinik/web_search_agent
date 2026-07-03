@@ -206,6 +206,7 @@ class ResearchConfig:
     stream: bool = False
     no_stealth: bool = False
     no_brightdata: bool = False
+    country: str = ""
 
 
 @dataclass
@@ -1250,10 +1251,13 @@ def _should_try_brightdata(error: str) -> bool:
     return bool(error) and (error in BRIGHTDATA_RETRY_ERRORS or error.startswith("Stealth"))
 
 
-def _brightdata_fetch_raw(url: str, token: str, zone: str, timeout: int) -> bytes:
+def _brightdata_fetch_raw(url: str, token: str, zone: str, timeout: int, country: str = "") -> bytes:
     """Blocking POST to the Web Unlocker API. Returns the rendered page bytes."""
     import urllib.request
-    payload = json.dumps({"zone": zone, "url": url, "format": "raw"}).encode("utf-8")
+    body = {"zone": zone, "url": url, "format": "raw"}
+    if country:
+        body["country"] = country.lower()  # ISO 3166-1 alpha-2, e.g. "us", "de"
+    payload = json.dumps(body).encode("utf-8")
     req = urllib.request.Request(
         BRIGHTDATA_ENDPOINT, data=payload, method="POST",
         headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
@@ -1269,6 +1273,7 @@ async def fetch_brightdata_async(
     timeout: int,
     progress: Optional[ProgressReporter] = None,
     query: str = "",
+    country: str = "",
 ) -> FetchResult:
     """Fetch a URL via the Bright Data Web Unlocker (rendered HTML through the shared extractor)."""
     token = _load_brightdata_token()
@@ -1282,7 +1287,7 @@ async def fetch_brightdata_async(
     loop = asyncio.get_event_loop()
     try:
         raw_bytes = await asyncio.wait_for(
-            loop.run_in_executor(None, _brightdata_fetch_raw, url, token, zone, bd_timeout),
+            loop.run_in_executor(None, _brightdata_fetch_raw, url, token, zone, bd_timeout, country),
             timeout=bd_timeout + 10,
         )
         elapsed = time.monotonic() - t0
@@ -1330,6 +1335,7 @@ async def escalate_if_blocked(
     no_brightdata: bool = False,
     progress: Optional[ProgressReporter] = None,
     query: str = "",
+    country: str = "",
 ) -> FetchResult:
     """Shared escalation ladder: given an already-attempted fetch, climb the remaining rungs.
 
@@ -1347,7 +1353,7 @@ async def escalate_if_blocked(
         return result
     if not no_brightdata and _should_try_brightdata(result.error) and _load_brightdata_token():
         result = await fetch_brightdata_async(
-            result.url, min_content_length, max_content_length, timeout, progress=progress, query=query,
+            result.url, min_content_length, max_content_length, timeout, progress=progress, query=query, country=country,
         )
     return result
 
@@ -1719,7 +1725,7 @@ async def run_research_async(
             escalate_if_blocked(
                 cand, config.min_content_length, config.max_content_length, config.timeout,
                 no_stealth=config.no_stealth, no_brightdata=config.no_brightdata,
-                progress=progress, query=config.query,
+                progress=progress, query=config.query, country=config.country,
             )
             for cand in retry_candidates
         ))
@@ -2138,6 +2144,8 @@ Blocked domains: reddit, twitter, facebook, youtube, tiktok, instagram, linkedin
                         help="Disable stealth browser retry for blocked pages")
     parser.add_argument("--no-brightdata", action="store_true",
                         help="Disable the paid Bright Data Web Unlocker last-resort tier")
+    parser.add_argument("--country", default="", metavar="XX",
+                        help="Route the Bright Data tier through a specific country (ISO alpha-2, e.g. us, de, gb)")
     parser.add_argument("-S", "--summarize", action="store_true", default=False,
                         help="Summarize results via Gemini Flash (default: off)")
     parser.add_argument("--no-summarize", action="store_true",
@@ -2195,6 +2203,7 @@ Blocked domains: reddit, twitter, facebook, youtube, tiktok, instagram, linkedin
                 result = await escalate_if_blocked(
                     result, 100, url_max, args.timeout,
                     no_stealth=args.no_stealth, no_brightdata=args.no_brightdata, progress=progress,
+                    country=args.country,
                 )
                 results.append(result)
             return results
@@ -2242,6 +2251,7 @@ Blocked domains: reddit, twitter, facebook, youtube, tiktok, instagram, linkedin
             stream=args.stream,
             no_stealth=args.no_stealth,
             no_brightdata=args.no_brightdata,
+            country=args.country,
         )
 
     # Hard wall-clock timeout: kill the entire process after 5 minutes
