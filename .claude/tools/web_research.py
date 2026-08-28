@@ -2594,16 +2594,22 @@ Blocked domains: reddit, twitter, facebook, youtube, tiktok, instagram, linkedin
             logger.debug(f"Cache unavailable: {e}")
 
     def _cache_write_results(results: List[FetchResult], query: str) -> None:
-        """Write successful fetch results to cache (best-effort)."""
+        """Write successful fetch results to cache (best-effort).
+
+        One batched call for the whole set. Embedding per page cost roughly
+        twelve times as much per item.
+        """
         if not cache:
             return
-        for r in results:
-            if r.success and r.content:
-                try:
-                    domain = urllib.parse.urlparse(r.url).netloc
-                    cache.store(r.url, domain, r.title, r.content, query)
-                except Exception:
-                    pass
+        try:
+            batch = [
+                (r.url, urllib.parse.urlparse(r.url).netloc, r.title, r.content, query)
+                for r in results if r.success and r.content
+            ]
+            if batch:
+                cache.store_many(batch)
+        except Exception as e:
+            logger.debug(f"Cache write failed: {e}")
 
     def _cache_hits_to_results(query: str) -> Optional[List[FetchResult]]:
         """Check cache for hits. Returns FetchResult list or None."""
