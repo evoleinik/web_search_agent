@@ -24,7 +24,12 @@ import sys
 import time
 from dataclasses import dataclass
 from math import sqrt
-from typing import List, Optional, Tuple
+from typing import List, Optional, Sequence, Tuple
+
+try:
+    import numpy as _np
+except ImportError:  # scoring falls back to pure Python
+    _np = None
 
 # =============================================================================
 # DOMAIN AUTHORITY MAP
@@ -279,6 +284,85 @@ def _cosine_similarity(a: List[float], b: List[float]) -> float:
 
 
 # =============================================================================
+# SCORING
+# =============================================================================
+
+# Rows are (url, embedding_blob, authority, fetched_at). Scored as
+#     similarity * 0.6 + authority * 0.3 + freshness * 0.1
+# and returned as (url, score, similarity) for rows clearing min_similarity.
+
+
+def _score_rows_python(
+    rows: Sequence[tuple],
+    query_emb: List[float],
+    now: float,
+    max_age_hours: int,
+    min_similarity: float,
+) -> List[Tuple[str, float, float]]:
+    out: List[Tuple[str, float, float]] = []
+    for url, emb_blob, authority, fetched_at in rows:
+        sim = _cosine_similarity(query_emb, _blob_to_embed(emb_blob))
+        if sim < min_similarity:
+            continue
+        freshness = max(0.0, 1.0 - ((now - fetched_at) / 3600.0) / max_age_hours)
+        out.append((url, sim * 0.6 + authority * 0.3 + freshness * 0.1, sim))
+    return out
+
+
+def _score_rows_numpy(
+    rows: Sequence[tuple],
+    query_emb: List[float],
+    now: float,
+    max_age_hours: int,
+    min_similarity: float,
+) -> Optional[List[Tuple[str, float, float]]]:
+    """One matmul over the whole window. Returns None if the blobs are ragged."""
+    dim = len(query_emb)
+    mat = _np.frombuffer(b"".join(r[1] for r in rows), dtype="<f4")
+    if mat.size != len(rows) * dim:  # a row stored at a different width
+        return None
+    mat = mat.reshape(len(rows), dim)
+
+    qv = _np.asarray(query_emb, dtype="<f4")
+    q_norm = _np.linalg.norm(qv)
+    if q_norm == 0:
+        return []
+
+    norms = _np.linalg.norm(mat, axis=1)
+    norms[norms == 0] = 1.0
+    sims = (mat @ (qv / q_norm)) / norms
+
+    keep = _np.flatnonzero(sims >= min_similarity)
+    if keep.size == 0:
+        return []
+
+    kept_sims = sims[keep]
+    authority = _np.fromiter((rows[i][2] for i in keep), dtype="<f8", count=keep.size)
+    fetched_at = _np.fromiter((rows[i][3] for i in keep), dtype="<f8", count=keep.size)
+    freshness = _np.maximum(0.0, 1.0 - ((now - fetched_at) / 3600.0) / max_age_hours)
+    scores = kept_sims * 0.6 + authority * 0.3 + freshness * 0.1
+
+    return [
+        (rows[i][0], float(scores[k]), float(kept_sims[k]))
+        for k, i in enumerate(keep)
+    ]
+
+
+def _score_rows(
+    rows: Sequence[tuple],
+    query_emb: List[float],
+    now: float,
+    max_age_hours: int,
+    min_similarity: float,
+) -> List[Tuple[str, float, float]]:
+    if _np is not None:
+        scored = _score_rows_numpy(rows, query_emb, now, max_age_hours, min_similarity)
+        if scored is not None:
+            return scored
+    return _score_rows_python(rows, query_emb, now, max_age_hours, min_similarity)
+
+
+# =============================================================================
 # CACHE
 # =============================================================================
 
@@ -338,6 +422,10 @@ class SearchCache:
 
         Returns top_k results ranked by:
             similarity * 0.6 + authority * 0.3 + freshness * 0.1
+
+        The ranking scan reads embeddings only. Page content is fetched in a
+        second query, for the winners alone. Scanning content made every lookup
+        read hundreds of MB it then threw away.
         """
         query_emb = _embed_ollama(query)
         if query_emb is None:
@@ -346,29 +434,41 @@ class SearchCache:
         conn = self._connect()
         cutoff = time.time() - (max_age_hours * 3600)
         rows = conn.execute(
-            "SELECT url, domain, title, content, query, embedding, authority, fetched_at "
+            "SELECT url, embedding, authority, fetched_at "
             "FROM pages WHERE fetched_at > ? AND embedding IS NOT NULL",
             (cutoff,),
         ).fetchall()
+        if not rows:
+            return []
 
-        now = time.time()
+        scored = _score_rows(rows, query_emb, time.time(), max_age_hours, min_similarity)
+        if not scored:
+            return []
+        scored.sort(key=lambda s: s[1], reverse=True)
+        scored = scored[:top_k]
+
+        urls = [url for url, _, _ in scored]
+        detail = {
+            row[0]: row
+            for row in conn.execute(
+                "SELECT url, domain, title, content, query, authority, fetched_at "
+                "FROM pages WHERE url IN (%s)" % ",".join("?" * len(urls)),
+                urls,
+            )
+        }
+
         hits: List[CacheHit] = []
-        for url, domain, title, content, orig_query, emb_blob, authority, fetched_at in rows:
-            page_emb = _blob_to_embed(emb_blob)
-            sim = _cosine_similarity(query_emb, page_emb)
-            if sim < min_similarity:
+        for url, score, sim in scored:
+            row = detail.get(url)
+            if row is None:  # deleted between the two queries
                 continue
-            age_hours = (now - fetched_at) / 3600
-            freshness = max(0.0, 1.0 - age_hours / max_age_hours)
-            score = sim * 0.6 + authority * 0.3 + freshness * 0.1
+            _, domain, title, content, orig_query, authority, fetched_at = row
             hits.append(CacheHit(
                 url=url, domain=domain, title=title, content=content,
                 query=orig_query, authority=authority, fetched_at=fetched_at,
                 similarity=sim, score=score,
             ))
-
-        hits.sort(key=lambda h: h.score, reverse=True)
-        return hits[:top_k]
+        return hits
 
     def store(
         self,
@@ -434,6 +534,49 @@ class SearchCache:
         print(f"  Fresh: {s['fresh_24h']} (<24h), {s['fresh_7d']} (<7d)", file=sys.stderr)
         if s['oldest']:
             print(f"  Range: {s['oldest']} — {s['newest']}", file=sys.stderr)
+
+    def prune(self, max_age_hours: int = 168, vacuum: bool = True) -> dict:
+        """Delete rows older than max_age_hours and reclaim the file space.
+
+        lookup() never reads outside its age window, so older rows are dead
+        weight. Nothing else ever deleted from this table, so the file only grew.
+        """
+        conn = self._connect()
+        cutoff = time.time() - (max_age_hours * 3600)
+        rows_before = conn.execute("SELECT COUNT(*) FROM pages").fetchone()[0]
+        mb_before = round(os.path.getsize(self.db_path) / 1048576, 1)
+
+        deleted = conn.execute("DELETE FROM pages WHERE fetched_at <= ?", (cutoff,)).rowcount
+        conn.commit()
+
+        vacuumed = False
+        if vacuum and deleted:
+            prev = conn.isolation_level
+            conn.isolation_level = None  # VACUUM cannot run inside a transaction
+            try:
+                conn.execute("VACUUM")
+                vacuumed = True
+            except sqlite3.OperationalError:
+                pass  # another process holds the file; space reclaims next run
+            finally:
+                conn.isolation_level = prev
+
+        return {
+            "rows_before": rows_before,
+            "rows_deleted": deleted,
+            "rows_after": rows_before - deleted,
+            "mb_before": mb_before,
+            "mb_after": round(os.path.getsize(self.db_path) / 1048576, 1),
+            "vacuumed": vacuumed,
+        }
+
+    def print_prune(self, max_age_hours: int = 168) -> None:
+        """Prune and report to stderr."""
+        r = self.prune(max_age_hours)
+        busy = ", vacuum skipped (db busy)" if r["rows_deleted"] and not r["vacuumed"] else ""
+        print(f"Pruned {r['rows_deleted']} pages older than {max_age_hours}h "
+              f"({r['rows_before']} -> {r['rows_after']} rows, "
+              f"{r['mb_before']}MB -> {r['mb_after']}MB){busy}", file=sys.stderr)
 
     def close(self) -> None:
         if self._conn:
