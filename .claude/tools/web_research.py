@@ -2454,6 +2454,8 @@ Blocked domains: reddit, twitter, facebook, youtube, tiktok, instagram, linkedin
                         help="Only return cached results, no web fetch")
     parser.add_argument("--cache-stats", action="store_true",
                         help="Print cache statistics and exit")
+    parser.add_argument("--cache-prune", type=int, nargs="?", const=168, metavar="HOURS",
+                        help="Delete cached pages older than HOURS (default 168), vacuum, exit")
     parser.add_argument("--max-age", type=int, default=168,
                         help="Max cache age in hours (default: 168 = 7 days)")
     parser.add_argument("--usage", action="store_true",
@@ -2467,12 +2469,16 @@ Blocked domains: reddit, twitter, facebook, youtube, tiktok, instagram, linkedin
         print_usage_stats(quality=args.quality)
         sys.exit(0)
 
-    if args.cache_stats:
+    if args.cache_stats or args.cache_prune is not None:
         _tools_dir = os.path.dirname(os.path.abspath(__file__))
         if _tools_dir not in sys.path:
             sys.path.insert(0, _tools_dir)
         from search_cache import SearchCache
-        SearchCache().print_stats()
+        _cache = SearchCache()
+        if args.cache_prune is not None:
+            _cache.print_prune(args.cache_prune)
+        else:
+            _cache.print_stats()
         sys.exit(0)
 
     # --no-summarize overrides -S default
@@ -2588,16 +2594,22 @@ Blocked domains: reddit, twitter, facebook, youtube, tiktok, instagram, linkedin
             logger.debug(f"Cache unavailable: {e}")
 
     def _cache_write_results(results: List[FetchResult], query: str) -> None:
-        """Write successful fetch results to cache (best-effort)."""
+        """Write successful fetch results to cache (best-effort).
+
+        One batched call for the whole set. Embedding per page cost roughly
+        twelve times as much per item.
+        """
         if not cache:
             return
-        for r in results:
-            if r.success and r.content:
-                try:
-                    domain = urllib.parse.urlparse(r.url).netloc
-                    cache.store(r.url, domain, r.title, r.content, query)
-                except Exception:
-                    pass
+        try:
+            batch = [
+                (r.url, urllib.parse.urlparse(r.url).netloc, r.title, r.content, query)
+                for r in results if r.success and r.content
+            ]
+            if batch:
+                cache.store_many(batch)
+        except Exception as e:
+            logger.debug(f"Cache write failed: {e}")
 
     def _cache_hits_to_results(query: str) -> Optional[List[FetchResult]]:
         """Check cache for hits. Returns FetchResult list or None."""
