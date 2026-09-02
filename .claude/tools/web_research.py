@@ -11,8 +11,9 @@ Unified tool combining search and fetch into a single optimized workflow:
 1. Search via DuckDuckGo + Brave (fallback) for maximum coverage
 2. Filter and deduplicate URLs during search (early filtering)
 3. Fetch content in parallel via Scrapling (TLS fingerprinting, anti-bot bypass)
-4. Blocked-page escalation ladder: local stealth browser (camoufox) then Bright Data
-   Web Unlocker (paid, last-resort). Search path escalates only the failing URLs.
+4. Blocked-page escalation ladder: obscura (Rust headless, ~35 MB, when on PATH), then
+   local stealth browser (camoufox), then Bright Data Web Unlocker (paid, last-resort).
+   Search path escalates only the failing URLs.
 5. Scrapling text extraction fallback for "Too short" pages
 6. Output combined results (streaming or batched)
 
@@ -253,6 +254,7 @@ def _quality_fields(results: Optional[List[FetchResult]]) -> dict:
         "short_pages": sum(1 for r in results if r.success and len(r.content) < 200),
         "domains": list({urllib.parse.urlparse(r.url).netloc for r in results if r.success}),
         "stealth_retries": sum(1 for r in results if r.source == "stealth"),
+        "obscura_hits": sum(1 for r in results if r.source == "obscura"),
     }
 
 
@@ -1175,6 +1177,76 @@ async def fetch_single_async(
 
 MAX_STEALTH_RETRIES = 5  # Cap to avoid slowing down the whole search
 
+# -----------------------------------------------------------------------------
+# Rung 2a: obscura (Rust headless browser, ~35 MB RSS), tried BEFORE camoufox.
+# Present only where installed (box: ~/bin/obscura). A cheap JS render for pages that
+# 403 a plain TLS-fingerprint fetch but sit behind no real WAF. Measured 2026-09-02: it
+# fails Imperva (fingerprint block) and Akamai (TLS stall), so any failure falls through
+# to camoufox carrying the ORIGINAL error. Downstream gating is unchanged by this rung.
+# -----------------------------------------------------------------------------
+OBSCURA_BIN = os.environ.get("OBSCURA_BIN") or shutil.which("obscura")
+OBSCURA_TIMEOUT = int(os.environ.get("OBSCURA_TIMEOUT", "15"))
+
+
+async def fetch_obscura_async(
+    url: str,
+    min_content_length: int,
+    max_content_length: int,
+    progress: Optional[ProgressReporter] = None,
+    query: str = "",
+) -> FetchResult:
+    """Render one URL with `obscura --stealth` and extract it like the other rungs.
+
+    obscura exits 0 and prints a tiny body on non-200 responses (no status is exposed),
+    so failure is judged on the rendered bytes: blocked markers, PDF, or too-short text.
+    """
+    t0 = time.monotonic()
+    if not OBSCURA_BIN:
+        return FetchResult(url=url, success=False, error="Obscura: not installed", source="obscura")
+    proc = None
+
+    def _fail(err: str) -> FetchResult:
+        if progress:
+            progress.url_result(url, False, time.monotonic() - t0, err)
+        return FetchResult(url=url, success=False, error=err, source="obscura")
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            OBSCURA_BIN, "--stealth", "fetch", url, "--dump", "html", "-q",
+            "--timeout", str(OBSCURA_TIMEOUT),
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=OBSCURA_TIMEOUT + 10)
+        raw_html = stdout.decode("utf-8", errors="replace")[:MAX_CONTENT_BYTES]
+        if proc.returncode != 0:
+            return _fail(f"Obscura exit {proc.returncode}")
+        if len(raw_html) < 50:
+            return _fail("Obscura empty page")
+        if _is_pdf(raw_html, url):
+            return _fail("Obscura: PDF")
+        if is_blocked_content(raw_html):
+            return _fail("Obscura still blocked")
+
+        loop = asyncio.get_event_loop()
+        content, structured = await loop.run_in_executor(
+            _get_extract_pool(), _extract_content, raw_html
+        )
+        if structured:
+            content = structured + content
+        result = _create_fetch_result(url, content, min_content_length, max_content_length, query=query)
+        result.source = "obscura"
+        if progress:
+            progress.url_result(url, result.success, time.monotonic() - t0, result.error or "")
+        return result
+
+    except asyncio.TimeoutError:
+        if proc is not None and proc.returncode is None:
+            proc.kill()
+        return _fail("Obscura: Timeout")
+    except Exception as e:
+        return _fail(f"Obscura: {str(e)[:50] or type(e).__name__}")
+
+
 async def fetch_stealth_async(
     url: str,
     min_content_length: int,
@@ -1394,7 +1466,8 @@ async def escalate_if_blocked(
 ) -> FetchResult:
     """Shared escalation ladder: given an already-attempted fetch, climb the remaining rungs.
 
-    Rung 2: local StealthyFetcher (free) on block-type errors.
+    Rung 2a: obscura (free, ~35 MB) on block-type errors, when installed.
+    Rung 2b: local StealthyFetcher / camoufox (free) when obscura did not render it.
     Rung 3: Bright Data Web Unlocker (paid) when still blocked and a token is present.
     Used by both the direct-fetch and search paths so the algorithm stays DRY.
 
@@ -1408,6 +1481,14 @@ async def escalate_if_blocked(
     domain = _rung_domain(result.url)
     known_bd = (not no_rung_memory) and _rung_memory_get(domain) == "brightdata"
     if not no_stealth and not known_bd and result.error in STEALTH_RETRY_ERRORS:
+        if OBSCURA_BIN:
+            obscura_result = await fetch_obscura_async(
+                result.url, min_content_length, max_content_length, progress=progress, query=query,
+            )
+            if obscura_result.success:
+                return obscura_result
+            # Not rendered by obscura: keep the ORIGINAL block error so the camoufox and
+            # Bright Data gates below see exactly what they saw before this rung existed.
         result = await fetch_stealth_async(
             result.url, min_content_length, max_content_length, progress=progress, query=query,
         )
